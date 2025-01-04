@@ -5,7 +5,7 @@ import numpy as np
 from FastNoise import FastNoise
 from typing import Tuple
 from dataclasses import dataclass
-
+from Spline import Spline
 
 
 
@@ -93,7 +93,6 @@ class PreviewSubWindow(ABC):
 
     def _get_window_width(self, window) -> int:
         w = dpg.get_item_width(window)
-        print(dpg.get_item_alias(window))
         if w == -1 or w == 0:
             return self._get_window_width(dpg.get_item_parent(window))
         return w
@@ -112,6 +111,13 @@ class PreviewSubWindow(ABC):
     def get_tag(self, tag: str) -> str:
         return f"{tag}{id(self)}"
     
+    
+    def show(self):
+        dpg.show_item(self.window)
+        
+    def hide(self):
+        dpg.hide_item(self.window)
+        
 class NoisePreview(PreviewSubWindow):
     SIZE = (512, 512)
     window_size = None
@@ -120,7 +126,7 @@ class NoisePreview(PreviewSubWindow):
         self.current_noise = None
         self.view_state = ViewState()
         self.buffer = np.zeros(self.SIZE[0] * self.SIZE[1], dtype=np.float32)
-        
+        self.spline = None
     def _handle_drag(self, sender: int, mouse_data: Tuple[int, float, float]) -> None:
         if not dpg.is_item_hovered(self.window) or not all(mouse_data[1:]):
             return
@@ -168,7 +174,8 @@ class NoisePreview(PreviewSubWindow):
                 dpg.add_mouse_release_handler(callback=self._handle_release)
                 
             dpg.bind_item_handler_registry(self.window, "handler_registry")
-            
+        self.hide()
+        
     def update_noise(self, noise: FastNoise) -> None:
         dpg.set_value(self.get_tag("frequency"), clamp(dpg.get_value(self.get_tag("frequency")), 0, 2**32))
         self.current_noise = noise
@@ -182,59 +189,87 @@ class NoisePreview(PreviewSubWindow):
             dpg.get_value(self.get_tag("frequency")),
             dpg.get_value(self.get_tag("seed"))
         )
-        
+        if self.spline:
+            self.buffer = self.spline.evaluate(self.buffer)
         dpg.set_value(self.get_tag("noise_texture"), np.repeat(self.buffer, 3))
-
     def get_tab_name(self) -> str:
         return self.noise_name
 
 
-@dataclass
-class PreviewTab:
-    tab: int
-    sub_window: List[PreviewSubWindow]
-
 class PreviewWindow:
-    
-    windows = []
+    windows = {}
     tab_bar = None
     window = None
-    
+    current_tab = None
+
     @classmethod
     def render(cls):
         with dpg.window(label="Preview", tag="preview_window") as cls.window:
             cls.tab_bar = dpg.add_tab_bar(
                 tag="preview_tab_bar",
                 show=False,
-                reorderable=True,
-                callback=cls._open_popup
+                reorderable=True
             )
             with dpg.child_window(tag="Container", always_auto_resize=True) as cls.container:
                 with dpg.group() as cls.group_container:
                     pass
-    
+            with dpg.item_handler_registry(tag="tab_bar_handler"):
+                dpg.add_item_clicked_handler(callback=cls._on_click)
+
     @classmethod
-    def _open_popup(cls, sender: int, app_data: any):
-        with dpg.popup(app_data):
-            dpg.add_menu_item(label="Add to group")
-    
+    def _on_click(cls, sender: int, app_data: int):
+        if app_data[0] == 1:
+            cls._open_popup(app_data[1])
+        elif app_data[0] == 0:
+            cls._open_tab(app_data[1])
+
+    @classmethod
+    def _open_popup(cls, sender: int):
+        with dpg.popup(sender, mousebutton=dpg.mvMouseButton_Right, modal=False):
+            dpg.add_menu_item(label="Move into this tab", callback=lambda: cls._extend_tab(sender))
+
+    @classmethod
+    def _extend_tab(cls, tab_group: int):
+        if cls.current_tab is None or tab_group not in cls.windows:
+            return
+        if tab_group in cls.windows:
+            cls.windows[cls.current_tab].extend(cls.windows[tab_group])
+            dpg.delete_item(tab_group)
+            del cls.windows[tab_group]
+            cls._open_tab(cls.current_tab)
+
+    @classmethod
+    def _open_tab(cls, tab: int):
+        if cls.current_tab:
+            for window in cls.windows[cls.current_tab]:
+                dpg.hide_item(window.window)
+        cls.current_tab = tab
+        for window in cls.windows.get(tab, []):
+            dpg.show_item(window.window)
+
     @classmethod
     def add_window(cls, sub_window: PreviewSubWindow):
         with dpg.tab(label=sub_window.get_tab_name(), parent=cls.tab_bar) as tab:
             sub_window.tab = tab
-
-        cls.windows.append(PreviewTab(tab, sub_window))
+            cls.windows[tab] = [sub_window]
+            dpg.bind_item_handler_registry(tab, "tab_bar_handler")
+            
+        sub_window.render(cls.group_container)
+        if cls.current_tab is None:
+                cls._open_tab(tab)
         cls.update_tab_bar()
-    
+
     @classmethod
     def remove_window(cls, sub_window: PreviewSubWindow):
-        if sub_window in cls.windows:
-            for tab in cls.windows:
-                if tab.sub_window == sub_window:
-                    cls.windows.remove(tab)
-            dpg.delete_item(sub_window.tab)
-            cls.update_tab_bar()
-    
+        for tab, windows in cls.windows.items():
+            if sub_window in windows:
+                windows.remove(sub_window)
+                if not windows:
+                    dpg.delete_item(tab)
+                    del cls.windows[tab]
+        dpg.delete_item(sub_window.window)
+        cls.update_tab_bar()
+
     @classmethod
     def update_tab_bar(cls):
         if cls.windows:
@@ -242,6 +277,114 @@ class PreviewWindow:
         else:
             dpg.hide_item(cls.tab_bar)
 
+class SplinePreview(PreviewSubWindow):
+    SIZE = (512, 512)
+    def __init__(self, noise_preview: NoisePreview):
+        super().__init__(f"spline_{noise_preview.get_tab_name()}")
+        self.noise_preview = noise_preview
+        self.points = {}
+        self.point_id = 0
+        self.line = None
+        self.plot = None
+        self.mode = 0
+        spline = Spline([0, 0, 1, 1])
+        self.spline = spline
+        noise_preview.spline =  spline
+
+    def clamp(self, value: float, min_val: float, max_val: float) -> float:
+        return max(min_val, min(value, max_val))
+
+    def on_point_move(self, sender, data):
+        if self.mode == 1:
+            self.spline.remove_point(dpg.get_value(sender)[0])
+            del self.points[dpg.get_item_alias(sender)]
+            dpg.delete_item(sender)
+            self.update_lines()
+            self.mode = 0
+            return
+
+        x_min_max = dpg.get_axis_limits("x_axis")
+        y_min_max = dpg.get_axis_limits("y_axis")
+
+        new_pos = [
+            self.clamp(dpg.get_value(sender)[0], x_min_max[0], x_min_max[1]),
+            self.clamp(dpg.get_value(sender)[1], y_min_max[0], y_min_max[1])
+        ]
+
+        dpg.set_value(sender, new_pos)
+        item_name = dpg.get_item_alias(sender)
+
+        if self.points[item_name] != new_pos:
+            self.spline.remove_control_point(self.points[item_name][0])
+
+            self.points[item_name] = new_pos
+            self.spline.add_control_points([new_pos])
+            self.update_lines()
+            self.noise_preview.update_noise(self.noise_preview.current_noise)
+
+    def add_point(self, x: float, y: float):
+        point_tag = f"point_{self.point_id}"
+
+        point_id = dpg.add_drag_point(
+            color=[255, 255, 255, 255],
+            default_value=[x, y],
+            callback=self.on_point_move,
+            parent=self.plot,
+            tag=point_tag
+        )
+
+        self.point_id += 1
+        self.points[point_id] = [x, y]
+        self.spline.add_control_points([(x, y)])
+        self.update_lines()
+
+    def remove_point(self, x: float, y: float):
+        self.mode = 1
+
+    def update_lines(self):
+        if self.line:
+            dpg.delete_item(self.line)
+            self.line = None
+
+        points = list(self.points.values())
+        if len(points) < 2:
+            return
+
+        sorted_points = sorted(points, key=lambda point: point[0])
+        lines_x = [point[0] for point in sorted_points]
+        lines_y = [point[1] for point in sorted_points]
+
+        self.line = dpg.add_line_series(
+            x=lines_x,
+            y=lines_y,
+            label="",
+            parent="x_axis"
+        )
+
+    def render(self, parent: int):
+        with dpg.child_window(label=self.title, width=self.SIZE[0], height=self.SIZE[1] + 75, parent=parent) as self.window:
+            with dpg.plot(height=self.SIZE[0], width=self.SIZE[1]) as plot:
+                self.plot = plot
+                x_axis = dpg.add_plot_axis(dpg.mvXAxis, label="X", tag="x_axis")
+                dpg.set_axis_limits(x_axis, 0, 1)
+                y_axis = dpg.add_plot_axis(dpg.mvYAxis, label="Y", tag="y_axis")
+                dpg.set_axis_limits(y_axis, 0, 1)
+                self.add_point(0, 0)
+                self.add_point(1, 1)
+
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Add Point", callback=lambda: self.add_point(0.5, 0.5))
+                dpg.add_button(label="Remove Point", callback=lambda: self.remove_point(0, 0))
+        self.hide()
+        
+    def show(self):
+        dpg.show_item(self.window)
+
+    def hide(self):
+        dpg.hide_item(self.window)
+        
+    def get_tab_name(self):
+        return f"spline_{self.noise_preview.get_tab_name()}"
 class ContentSelector:
     
     window = None
@@ -321,15 +464,8 @@ class WorldGenerationTool:
         prev = NoisePreview("Erosion")
         PreviewWindow.add_window(prev)
         prev.update_noise(FastNoise.from_encoded_node_tree("FwAAAIC/AACAPwAAAAAAAIA/CQA="))
-        prev = NoisePreview("Erosion")
+        prev = SplinePreview(prev)
         PreviewWindow.add_window(prev)
-        prev.update_noise(FastNoise.from_encoded_node_tree("FwAAAIC/AACAPwAAAAAAAIA/CQA="))
-        prev = NoisePreview("Erosion")
-        PreviewWindow.add_window(prev)
-        prev.update_noise(FastNoise.from_encoded_node_tree("FwAAAIC/AACAPwAAAAAAAIA/CQA="))
-        prev = NoisePreview("Erosion")
-        PreviewWindow.add_window(prev)
-        prev.update_noise(FastNoise.from_encoded_node_tree("FwAAAIC/AACAPwAAAAAAAIA/CQA="))
     def _run_app(self):
         dpg.set_exit_callback(self._on_exit)
         dpg.show_viewport()
@@ -339,5 +475,16 @@ class WorldGenerationTool:
     def _on_exit(self):
         dpg.save_init_file("config.ini")
 
+# Initialize the spline with control points
+control_points = [0.0, 1.0, 1.0, 0.0]  # Control points (x, y)
+spline = Spline(control_points)
+
+# Buffer is a NumPy array of noise values between 0 and 1
+buffer = np.random.rand(1000).astype(np.float32)
+
+# Evaluate the spline at all buffer points
+buffer_processed = spline.evaluate(buffer)
+
+print("Processed buffer:", all(buffer_processed == buffer))
 if __name__ == "__main__":
     WorldGenerationTool()
